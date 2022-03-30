@@ -8,6 +8,12 @@ import time
 import argparse
 import os
 from model.network import *
+from model.network_awr import PoseNet
+from model.feature_tool import FeatureModule
+from loss import My_SmoothL1Loss
+import random
+
+
 
 parser = argparse.ArgumentParser()
 
@@ -34,6 +40,14 @@ parser.add_argument('--dp_rate', type=float, default=0.2,
                     help='dropout rate')  # 1000
 
 
+img_size = 128
+downsample = 2
+kernel_size = 0.4
+time_len = 8
+# time_len_replacements = 3
+ft_sz = int(img_size / downsample)
+FM = FeatureModule()
+
 
 
 def init_data_loader(test_subject_id, data_cfg):
@@ -42,9 +56,9 @@ def init_data_loader(test_subject_id, data_cfg):
 
 
     # TODO: use_data_aug = False -> to train key points detection
-    train_dataset = Hand_Dataset(train_data, use_data_aug = False, time_len = 8)
+    train_dataset = Hand_Dataset(train_data, use_data_aug = False, time_len = time_len)
 
-    test_dataset = Hand_Dataset(test_data, use_data_aug = False, time_len = 8)
+    test_dataset = Hand_Dataset(test_data, use_data_aug = False, time_len = time_len)
 
     print("train data num: ",len(train_dataset))
     print("test data num: ",len(test_dataset))
@@ -64,6 +78,7 @@ def init_data_loader(test_subject_id, data_cfg):
 
     return train_loader, val_loader
 
+
 def init_model(data_cfg):
     if data_cfg == 0:
         class_num = 14
@@ -72,30 +87,56 @@ def init_model(data_cfg):
 
     model = DG_STA(class_num, args.dp_rate)
     model = torch.nn.DataParallel(model).cuda()
+    
+    model_detection = PoseNet('hourglass_1', joint_num=22)
+    model_detection = torch.nn.DataParallel(model_detection).cuda()
 
-    return model
+    return model, model_detection
 
 
-def model_foreward(sample_batched,model,criterion):
+def model_forward(sample_batched, model, model_detection, criterion, criterion_detection):
 
-
-    data = sample_batched["skeleton"].float()
+    depth = sample_batched["depth"].float()
+    jt_uvd_gt = sample_batched["skeleton_proj"].float()  # 32, 8, 22, 2
+    offset_gt = FM.joint2offset(jt_uvd_gt, depth, kernel_size, ft_sz)
+    
     label = sample_batched["label"]
     label = label.type(torch.LongTensor)
     label = label.cuda()
     label = torch.autograd.Variable(label, requires_grad=False)
 
-
-    score = model(data)
+    # Select random time slot for training detection
+    ts = random.choice(list(range(time_len)))
+    depth_ts = depth[:, ts]
+    offset_gt_ts = offset_gt[:, ts]
+    offset_pred_ts = model_detection(depth_ts)
+    loss_detection = criterion_detection(offset_pred_ts, offset_gt_ts)
     
-    import ipdb; ipdb.set_trace()
+    # Inference all the coords for classification pipeline
+    jt_uvd_pred = []
+    with torch.no_grad():
+        for ts in range(time_len):
+            depth_ts = depth[:, ts]
+            offset_pred_ts = model_detection(depth_ts)
+            jt_uvd_pred_ts = FM.offset2joint_softmax(offset_pred_ts, depth_ts, kernel_size)
+            
+            # TODO: Scale coordinates back to original scale (broken after resampling to 128x128)
+            jt_uvd_pred_ts[:, 0] *= sample_batched["mult_w"]
+            jt_uvd_pred_ts[:, 1] *= sample_batched["mult_h"]
+        
+            jt_uvd_pred.append(jt_uvd_pred_ts)
+            
+    jt_uvd_pred = torch.stack(jt_uvd_pred, dim=1)
+    
+    score = model(jt_uvd_pred)
 
-    loss = criterion(score,label)
+    loss_clf = criterion(score, label)
+    
+    loss = loss_detection + loss_clf
 
     acc = get_acc(score, label)
 
-    return score,loss, acc
-
+    return score, loss, acc
 
 
 def get_acc(score, labels):
@@ -118,26 +159,20 @@ if __name__ == "__main__":
     #folder for saving trained model...
     # change this path to the fold where you want to save your pre-trained model
     model_fold = "/home/l.kulikov/dev/DG-STA/exp/DHS_ID-{}_dp-{}_lr-{}_dc-{}/".format(args.test_subject_id,args.dp_rate, args.learning_rate, args.data_cfg)
-    try:
-        os.makedirs(model_fold, exist_ok=True)
-        # os.mkdir(model_fold)
-    except:
-        pass
-
-
-
+    os.makedirs(model_fold, exist_ok=True)
 
     train_loader, val_loader = init_data_loader(args.test_subject_id,args.data_cfg)
 
 
     #.........inital model
     print("\ninit model.............")
-    model = init_model(args.data_cfg)
+    model, model_detection = init_model(args.data_cfg)
     model_solver = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate)
+    model_detection_solver = optim.Adam(filter(lambda p: p.requires_grad, model_detection.parameters()), lr=args.learning_rate)
 
     #........set loss
-    criterion = torch.nn.CrossEntropyLoss()
-
+    criterion = torch.nn.CrossEntropyLoss().cuda()
+    criterion_detection = My_SmoothL1Loss().cuda()
 
     #
     train_data_num = 2660
@@ -161,20 +196,19 @@ if __name__ == "__main__":
             #print("training i:",i)
             if i + 1 > iter_per_epoch:
                 continue
-            score,loss, acc = model_foreward(sample_batched, model, criterion)
+            # score,loss, acc = model_forward(sample_batched, model, criterion)
+            score, loss, acc = model_forward(sample_batched, model, model_detection, criterion, criterion_detection)
 
             model.zero_grad()
+            model_detection.zero_grad()
+            
             loss.backward()
-            #clip_grad_norm_(model.parameters(), 0.1)
+            
             model_solver.step()
-
+            model_detection_solver.step()
 
             train_acc += acc
             train_loss += loss
-
-            #print(i)
-
-
 
         train_acc /= float(i + 1)
         train_loss /= float(i + 1)
@@ -196,7 +230,7 @@ if __name__ == "__main__":
             for i, sample_batched in enumerate(val_loader):
                 #print("testing i:", i)
                 label = sample_batched["label"]
-                score, loss, acc = model_foreward(sample_batched, model, criterion)
+                score, loss, acc = model_forward(sample_batched, model, criterion)
                 val_loss += loss
 
                 if i == 0:

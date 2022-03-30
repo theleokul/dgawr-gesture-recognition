@@ -20,45 +20,98 @@ class Hand_Dataset(Dataset):
 
         self.time_len = time_len
         self.compoent_num = 22
+        self.depth_max = 50  # depth normalizer
+        self.crop_size = 128
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, ind):
-        #print("ind:",ind)
+                
         data_ele = self.data[ind]
 
-
         #hand skeleton
-        skeleton = data_ele["skeleton"]
-        skeleton = np.array(skeleton)
-        
-        depth = data_ele["depth"]
-        depth = [cv2.imread(dp, cv2.IMREAD_GRAYSCALE) / 255 for dp in depth]
-        depth = np.array(depth)
-        
-        # depth = depth[random.randint(0, len(depth) - 1)]  # Select random depth frame to train key points detection network
+        skeleton = np.array(data_ele["skeleton"])
+        skeleton_proj = np.array(data_ele["skeleton_proj"])
+        gen_info = np.array(data_ele["gen_info"])
 
-        if self.use_data_aug:
-            skeleton = self.data_aug(skeleton, depth)
+        # if self.use_data_aug:
+        #     skeleton = self.data_aug(skeleton, depth)
 
         # sample time_len frames from whole video
         data_num = skeleton.shape[0]
         idx_list = self.sample_frame(data_num)
+        
         skeleton = [skeleton[idx] for idx in idx_list]
         skeleton = np.array(skeleton)
+        
+        skeleton_proj = [skeleton_proj[idx] for idx in idx_list]
+        skeleton_proj = np.array(skeleton_proj)
+        
+        gen_info = [gen_info[idx] for idx in idx_list]
+        gen_info = np.array(gen_info)
+        
+        depth = [cv2.imread(depth[idx], cv2.IMREAD_GRAYSCALE) / self.depth_max for idx in idx_list]
+        depth = (np.array(depth).clip(0, 1) - .5) * 2  # [-1, 1]
 
-        #normalize by palm center
-        skeleton -= skeleton[0][1]
-
-
+        # Extend uv to uvd
+        skeleton_proj_d = np.empty((self.time_len, self.compoent_num, 1))
+        for t in range(self.time_len):
+            for k in range(self.compoent_num):
+                u, v = skeleton_proj[t, k].astype(int)
+                skeleton_proj_d[t, k] = depth[t, v, u]
+        skeleton_proj = np.concatenate([skeleton_proj, skeleton_proj_d], axis=-1)
+        
+        # Crop depth for detection (common crop for all the gesture frames)
+        x0_comm, x1_comm = depth.shape[-1], 0
+        y0_comm, y1_comm = depth.shape[-2], 0
+        for ts in range(self.time_len):
+            x, y, width, height = gen_info[ts].astype(int)
+            x0, x1 = x, x + width
+            y0, y1 = y, y + height
+            
+            if x0 < x0_comm:
+                x0_comm = x0
+            if x1 > x1_comm:
+                x1_comm = x1
+                
+            if y0 < y0_comm:
+                y0_comm = y0
+            if y1 > y1_comm:
+                y1_comm = y1
+                
+        mult_h = (y1_comm - y0_comm) / self.crop_size
+        mult_w = (x1_comm - x0_comm)  / self.crop_size
+            
+        depth_crop = depth[:, y0 : y1, x0 : x1]
+        depth_crop = [cv2.resize(depth_crop[ts], (self.crop_size, self.crop_size), interpolation=cv2.INTER_LINEAR) for ts in range(self.time_len)]
+        depth_crop = np.array(depth_crop)
+        
+        # Tune skeleton_proj to crop and normalize to [-1, 1]
+        skeleton_proj[:, :, 0] = ((skeleton_proj[:, :, 0] - x0) / (x1_comm - x0_comm) - .5) * 2
+        skeleton_proj[:, :, 1] = ((skeleton_proj[:, :, 1] - y0) / (y1_comm - y0_comm) - .5) * 2
+        skeleton_proj = skeleton_proj.clip(-1, 1)
 
         skeleton = torch.from_numpy(skeleton).float()
-        #print(skeleton.shape)
+        skeleton_proj = torch.from_numpy(skeleton_proj).float()
+        gen_info = torch.from_numpy(gen_info).long()
+        depth_crop = torch.from_numpy(depth_crop).float().unsqueeze(1)  # T, [1], H, W
+        
         # label
-        label = data_ele["label"] - 1 #
+        label = data_ele["label"] - 1
 
-        sample = {'skeleton': skeleton, "label" : label}
+        sample = {
+            # Crop
+            "skeleton_proj": skeleton_proj,
+            "depth": depth_crop,
+            "mult_h": mult_h,
+            "mult_w": mult_w,
+            
+            # Raw
+            "skeleton": skeleton,
+            "gen_info": gen_info,
+            "label" : label,
+        }
 
         return sample
 
@@ -120,9 +173,6 @@ class Hand_Dataset(Dataset):
             result = np.array(result)
             return result
 
-
-
-
         # og_id = np.random.randint(3)
         aug_num = 4
         ag_id = randint(0, aug_num - 1)
@@ -136,9 +186,6 @@ class Hand_Dataset(Dataset):
             skeleton = time_interpolate(skeleton)
 
         return skeleton
-
-
-
 
     def sample_frame(self, data_num):
         #sample #time_len frames from whole video

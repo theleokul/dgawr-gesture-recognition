@@ -16,6 +16,7 @@ class FeatureModule:
         :params kernel_size
         :params feature_size: size of generated offsets feature 
         '''
+        
         batch_size, jt_num, _ = jt_uvd.size()
         img = F.interpolate(img, size = [feature_size, feature_size])
         jt_ft = jt_uvd.view(batch_size, -1, 1, 1).repeat(1, 1, feature_size, feature_size) # (B, joint_num*3, F, F)

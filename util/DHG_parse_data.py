@@ -4,6 +4,7 @@ from PIL import Image
 import numpy as np
 from tqdm import tqdm
 import cv2
+import os
 
 #change the path to your downloaded DHG dataset
 
@@ -46,7 +47,9 @@ def read_data_from_disk():
                     src_gen_info_path = root + '/general_information.txt'
                     gen_info = np.loadtxt(src_gen_info_path)[:, 1:]  # x, y, width, height
                     
-                    depth_maps = [p for p in glob(root + '/depth*.png')]
+                    depth_maps = [n for n in os.listdir(root) if 'depth' in n]
+                    depth_maps = sorted(depth_maps, key=lambda x: int(x[:-4].split('_')[1]))
+                    depth_maps = [os.path.join(root, dm) for dm in depth_maps]
                     
                     key = "{}_{}_{}_{}".format(g_id, f_id, sub_id, e_id)
                     

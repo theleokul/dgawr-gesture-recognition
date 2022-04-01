@@ -162,7 +162,7 @@ class PoseNet(nn.Module):
             if i < self.nstack - 1:
                 x = x + self.merge_preds[i](preds) + self.merge_features[i](feature)
 
-        return combined_hm_preds
+        return combined_hm_preds[0]
 
 if __name__ == "__main__":
     import os

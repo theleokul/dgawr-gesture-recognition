@@ -20,7 +20,7 @@ class Hand_Dataset(Dataset):
 
         self.time_len = time_len
         self.compoent_num = 22
-        self.depth_max = 50  # depth normalizer
+        self.depth_max = 10  # depth normalizer
         self.crop_size = 128
 
     def __len__(self):
@@ -33,6 +33,7 @@ class Hand_Dataset(Dataset):
         #hand skeleton
         skeleton = np.array(data_ele["skeleton"])
         skeleton_proj = np.array(data_ele["skeleton_proj"])
+        depth = data_ele["depth"]
         gen_info = np.array(data_ele["gen_info"])
 
         # if self.use_data_aug:
@@ -53,14 +54,6 @@ class Hand_Dataset(Dataset):
         
         depth = [cv2.imread(depth[idx], cv2.IMREAD_GRAYSCALE) / self.depth_max for idx in idx_list]
         depth = (np.array(depth).clip(0, 1) - .5) * 2  # [-1, 1]
-
-        # Extend uv to uvd
-        skeleton_proj_d = np.empty((self.time_len, self.compoent_num, 1))
-        for t in range(self.time_len):
-            for k in range(self.compoent_num):
-                u, v = skeleton_proj[t, k].astype(int)
-                skeleton_proj_d[t, k] = depth[t, v, u]
-        skeleton_proj = np.concatenate([skeleton_proj, skeleton_proj_d], axis=-1)
         
         # Crop depth for detection (common crop for all the gesture frames)
         x0_comm, x1_comm = depth.shape[-1], 0
@@ -83,13 +76,35 @@ class Hand_Dataset(Dataset):
         mult_h = (y1_comm - y0_comm) / self.crop_size
         mult_w = (x1_comm - x0_comm)  / self.crop_size
             
-        depth_crop = depth[:, y0 : y1, x0 : x1]
+        depth_crop = depth[:, y0_comm : y1_comm, x0_comm : x1_comm]
         depth_crop = [cv2.resize(depth_crop[ts], (self.crop_size, self.crop_size), interpolation=cv2.INTER_LINEAR) for ts in range(self.time_len)]
         depth_crop = np.array(depth_crop)
         
-        # Tune skeleton_proj to crop and normalize to [-1, 1]
-        skeleton_proj[:, :, 0] = ((skeleton_proj[:, :, 0] - x0) / (x1_comm - x0_comm) - .5) * 2
-        skeleton_proj[:, :, 1] = ((skeleton_proj[:, :, 1] - y0) / (y1_comm - y0_comm) - .5) * 2
+        # Change coordinate space to crop
+        skeleton_proj[:, :, 0] = skeleton_proj[:, :, 0] - x0_comm
+        skeleton_proj[:, :, 1] = skeleton_proj[:, :, 1] - y0_comm
+
+        # Extend uv to uvd
+        skeleton_proj_d = np.empty((self.time_len, self.compoent_num, 1))
+        for t in range(self.time_len):
+            for k in range(self.compoent_num):
+                u, v = skeleton_proj[t, k]
+                
+                # Rescale coordinate to resampled depth
+                u = int(u / mult_w)
+                v = int(v / mult_h)
+                
+                # Update if keypoints aren't within bounds
+                u, v = np.clip(u, 0, self.crop_size - 1), np.clip(v, 0, self.crop_size - 1)
+                skeleton_proj[t, k, 0] = u
+                skeleton_proj[t, k, 1] = v
+                
+                skeleton_proj_d[t, k] = depth_crop[t, v, u]
+        skeleton_proj = np.concatenate([skeleton_proj, skeleton_proj_d], axis=-1)
+        
+        # Normalize u, v to [-1, 1]
+        skeleton_proj[:, :, 0] = (skeleton_proj[:, :, 0] / self.crop_size - .5) * 2
+        skeleton_proj[:, :, 1] = (skeleton_proj[:, :, 1] / self.crop_size - .5) * 2
         skeleton_proj = skeleton_proj.clip(-1, 1)
 
         skeleton = torch.from_numpy(skeleton).float()
